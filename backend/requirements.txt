@@ -1,0 +1,11 @@
+# AquaViz backend — FastAPI service for server-side ocean-data slicing.
+#
+# Pinned to the stack in the PRD (Python 3.11+). Lower bounds keep us current
+# while staying reproducible; refresh with `pip list --outdated` as needed.
+
+fastapi>=0.111          # async REST API
+uvicorn[standard]>=0.30 # ASGI server (uvloop, httptools, websockets, watchfiles)
+xarray>=2024.9          # N-dimensional NetCDF parsing + slicing
+netCDF4>=1.7            # low-level NetCDF I/O (bundles libnetcdf/HDF5 wheels)
+numpy>=2.0              # array operations on sliced grids
+httpx>=0.27             # fetch NetCDF/Argo data from public sources

@@ -1,0 +1,1320 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AquaViz — 3D Ocean Globe</title>
+    <style>
+      /* ---- design tokens: a cyan holographic instrument, dark by nature ----
+         The glowing data field is the hero; every panel is quiet cyan-tinted
+         glass that recedes behind it. Numerics are set in a monospace so
+         readouts align like an instrument display — used only for real numbers,
+         never as decoration. */
+      :root {
+        --space: #05070d;
+        --ink:   #dfeaf2;   /* primary text            */
+        --ink-2: #93a7b8;   /* secondary / labels      */
+        --ink-3: #5f758a;   /* tertiary / hints        */
+        --cyan:  #3fd0ef;   /* holographic accent      */
+        --cyan-2:#66c3dc;   /* softer accent           */
+        --read:  #b7e6f2;   /* instrument readout text */
+        --edge:  rgba(63, 208, 239, 0.20);   /* cyan hairline        */
+        --edge-2:rgba(63, 208, 239, 0.10);   /* fainter hairline     */
+        --glass: rgba(8, 15, 26, 0.68);
+        --glass-2: rgba(8, 15, 26, 0.82);
+        --ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+        --r: 12px;
+      }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; height: 100%; overflow: hidden; }
+      body { font-family: var(--ui); background: var(--space); color: var(--ink); }
+      #viewport { position: absolute; inset: 0; }
+      /* radial space vignette behind the WebGL canvas */
+      #viewport::after {
+        content: ""; position: absolute; inset: 0; pointer-events: none;
+        background: radial-gradient(circle at 54% 46%, rgba(20,40,70,0.35), rgba(5,7,13,0.0) 46%);
+      }
+
+      /* ---- floating panels -------------------------------------------------*/
+      .glass {
+        position: absolute; z-index: 2; background: var(--glass);
+        border: 1px solid var(--edge); border-radius: var(--r);
+        backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+        box-shadow: 0 8px 30px rgba(0,0,0,0.35), inset 0 0 0 1px rgba(255,255,255,0.02);
+      }
+      #panel { top: 18px; left: 18px; width: 252px; padding: 16px 16px 14px;
+               max-height: calc(100vh - 36px); overflow-y: auto; }
+
+      /* wordmark: a scan reticle + the name, with a faint holographic glow. */
+      .brand { display: flex; align-items: center; gap: 9px; }
+      .brand .mark { color: var(--cyan); flex: none; filter: drop-shadow(0 0 6px rgba(63,208,239,.5)); }
+      .brand h1 {
+        margin: 0; font-size: 21px; font-weight: 600; letter-spacing: .4px;
+        text-shadow: 0 0 20px rgba(63,208,239,0.22);
+      }
+      .attrib { margin: 9px 0 15px; display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
+      .attrib .dataset { font-size: 12px; color: var(--ink-2); line-height: 1.35; }
+      .tag {
+        font-size: 10.5px; color: var(--cyan-2); padding: 2px 7px; border-radius: 999px;
+        border: 1px solid var(--edge); background: rgba(63,208,239,0.06); white-space: nowrap;
+      }
+
+      /* segmented control replaces the native dropdown (self-describing, on-brand). */
+      .seg { display: flex; gap: 3px; padding: 3px; margin-bottom: 15px;
+             background: rgba(4,9,16,0.6); border: 1px solid var(--edge-2); border-radius: 9px; }
+      .seg button {
+        flex: 1; padding: 7px 8px; font-family: var(--ui); font-size: 12.5px;
+        color: var(--ink-2); background: none; border: none; border-radius: 6px;
+        cursor: pointer; transition: color .15s, background .15s;
+      }
+      .seg button:hover:not(.active) { color: var(--ink); }
+      .seg button.active {
+        color: var(--space); font-weight: 600;
+        background: var(--cyan); box-shadow: 0 0 14px rgba(63,208,239,0.35);
+      }
+
+      /* slider rows: label left, live monospace readout right. */
+      .ctl { margin-bottom: 13px; }
+      .ctl .row { display: flex; align-items: baseline; justify-content: space-between; }
+      .ctl .name { font-size: 12px; color: var(--ink-2); }
+      .ctl .val { font-family: var(--mono); font-size: 12px; color: var(--read); letter-spacing: -.2px; }
+      input[type=range] {
+        -webkit-appearance: none; appearance: none; width: 100%; height: 3px;
+        margin: 9px 0 2px; border-radius: 2px; background: var(--edge); cursor: pointer;
+      }
+      input[type=range]::-webkit-slider-thumb {
+        -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%;
+        background: var(--cyan); box-shadow: 0 0 9px rgba(63,208,239,0.7); cursor: pointer;
+      }
+      input[type=range]::-moz-range-thumb {
+        width: 14px; height: 14px; border: none; border-radius: 50%;
+        background: var(--cyan); box-shadow: 0 0 9px rgba(63,208,239,0.7); cursor: pointer;
+      }
+
+      /* instruments: a proper toggle switch. */
+      .switch { display: flex; align-items: center; justify-content: space-between; margin: 4px 0 13px; }
+      .switch .name { font-size: 12px; color: var(--ink-2); }
+      .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+      .switch .track {
+        width: 38px; height: 20px; border-radius: 999px; background: rgba(4,9,16,0.7);
+        border: 1px solid var(--edge); position: relative; cursor: pointer; transition: background .18s, border-color .18s;
+      }
+      .switch .track::after {
+        content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px;
+        border-radius: 50%; background: var(--ink-3); transition: transform .18s, background .18s;
+      }
+      .switch input:checked + .track { background: rgba(63,208,239,0.18); border-color: var(--cyan); }
+      .switch input:checked + .track::after { transform: translateX(18px); background: var(--cyan); box-shadow: 0 0 9px rgba(63,208,239,0.7); }
+
+      /* ---- display controls: divider + compact colorbar/opacity editors ---*/
+      .divider { height: 1px; background: var(--edge-2); margin: 4px 0 13px; }
+      .play {
+        font-family: var(--ui); font-size: 11px; line-height: 1; cursor: pointer;
+        color: var(--cyan); background: rgba(63,208,239,0.08);
+        border: 1px solid var(--edge); border-radius: 6px; padding: 3px 8px;
+        transition: background .15s, color .15s;
+      }
+      .play:hover:not(:disabled) { background: rgba(63,208,239,0.18); }
+      .play:disabled { color: var(--ink-3); border-color: var(--edge-2); cursor: default; }
+      .sel {
+        width: 100%; margin-top: 8px; padding: 7px 9px; cursor: pointer;
+        font-family: var(--ui); font-size: 12.5px; color: var(--ink);
+        background: rgba(4,9,16,0.6); border: 1px solid var(--edge-2); border-radius: 8px;
+        -webkit-appearance: none; appearance: none;
+      }
+      .sel:focus-visible { border-color: var(--cyan); }
+      .seg.seg-sm { margin: 8px 0 0; }
+      .seg.seg-sm button { padding: 6px 8px; font-size: 12px; }
+      .linklike {
+        font-family: var(--ui); font-size: 11px; color: var(--cyan-2);
+        background: none; border: none; cursor: pointer; padding: 0;
+      }
+      .linklike:hover { color: var(--cyan); text-decoration: underline; }
+      .range-row { display: flex; align-items: center; gap: 8px; margin-top: 9px; }
+      .num {
+        flex: 1; width: 0; min-width: 0; padding: 6px 8px; -moz-appearance: textfield;
+        font-family: var(--mono); font-size: 12px; color: var(--read);
+        background: rgba(4,9,16,0.6); border: 1px solid var(--edge-2); border-radius: 7px;
+      }
+      .num:focus-visible { border-color: var(--cyan); outline: none; }
+      .num::-webkit-outer-spin-button, .num::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+      .num-sep { color: var(--ink-3); font-family: var(--mono); }
+
+      .hint { font-size: 11px; color: var(--ink-3); line-height: 1.5; }
+      .status { font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); min-height: 15px; margin-top: 9px; letter-spacing: -.2px; }
+      .err { color: #ff7a7a; font-size: 12px; }
+
+      /* ---- legend: its own slim calibrated bar, freeing the panel's height --*/
+      #legend { left: 18px; bottom: 18px; width: 236px; padding: 12px 14px; }
+      #legend .lg-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 8px; }
+      #legend .lg-var { font-size: 12px; color: var(--ink-2); }
+      #legend .lg-units { font-family: var(--mono); font-size: 11px; color: var(--cyan-2); }
+      #legend .lg-bar { height: 9px; border-radius: 5px; border: 1px solid var(--edge); }
+      #legend .lg-scale { display: flex; justify-content: space-between; margin-top: 6px;
+                          font-family: var(--mono); font-size: 11px; color: var(--ink-2); letter-spacing: -.2px; }
+
+      /* ---- instrument depth-profile card (bottom-right) --------------------*/
+      #profile { right: 18px; bottom: 18px; width: 320px; padding: 14px 16px; background: var(--glass-2); display: none; }
+      #profile.open { display: block; }
+      #profile .p-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+      #profile h2 { margin: 0; font-size: 15px; font-weight: 600; }
+      #profile .p-kind {
+        display: inline-block; margin-top: 4px; font-size: 10.5px; color: var(--cyan-2);
+        padding: 1px 8px; border-radius: 999px; border: 1px solid var(--edge); background: rgba(63,208,239,0.06);
+      }
+      #profile .p-close {
+        cursor: pointer; color: var(--ink-2); border: none; background: none; font-size: 20px;
+        line-height: 1; padding: 0 2px; border-radius: 6px;
+      }
+      #profile .p-close:hover { color: var(--ink); }
+      #profile .p-meta { display: flex; gap: 10px; align-items: baseline; font-family: var(--mono);
+                         font-size: 11px; margin: 10px 0 10px; letter-spacing: -.2px; }
+      #profile .p-meta .p-coord { color: var(--read); }
+      #profile .p-meta .p-date { color: var(--ink-3); }
+      #profile .p-vars { display: flex; gap: 6px; margin-bottom: 10px; }
+      #profile .p-vars button {
+        font-size: 12px; padding: 4px 11px; border-radius: 999px; cursor: pointer;
+        color: var(--ink-2); background: rgba(4,9,16,0.6); border: 1px solid var(--edge-2); transition: color .15s, background .15s;
+      }
+      #profile .p-vars button:hover:not(.active) { color: var(--ink); }
+      #profile .p-vars button.active { color: var(--space); background: var(--cyan-2); border-color: var(--cyan-2); font-weight: 600; }
+      #profile canvas { width: 100% !important; height: 200px !important; }
+
+      /* ---- quality floor: keyboard focus, reduced motion, small screens ----*/
+      :focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; border-radius: 3px; }
+      :focus:not(:focus-visible) { outline: none; }
+      @media (max-width: 560px) {
+        #panel, #legend, #profile { left: 12px; right: 12px; width: auto; }
+        #panel  { top: 12px; }
+        #legend { bottom: 12px; }
+        #profile { bottom: 12px; }
+        #legend[data-hidden-sm] { display: none; }
+      }
+    </style>
+    <script src="https://unpkg.com/chart.js@4.4.4/dist/chart.umd.js"></script>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.168.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.168.0/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="viewport"></div>
+
+    <div id="panel" class="glass">
+      <div class="brand">
+        <svg class="mark" viewBox="0 0 24 24" width="19" height="19" fill="none"
+             stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="6.5" />
+          <path d="M12 1.5v4M12 18.5v4M1.5 12h4M18.5 12h4" />
+        </svg>
+        <h1>AquaViz</h1>
+      </div>
+      <div class="attrib">
+        <span class="dataset" id="dataset">loading…</span>
+        <span class="tag" id="region" hidden></span>
+      </div>
+
+      <div id="cdn-warn" class="err" style="display:none">
+        Could not load Three.js from the CDN (network blocked). The API is still
+        live at <code>/field/temperature</code>; see the console.
+      </div>
+
+      <div class="seg" id="variable" role="tablist" aria-label="Variable"></div>
+
+      <div class="ctl">
+        <div class="row"><span class="name">Depth</span><span class="val" id="depth-val">—</span></div>
+        <input type="range" id="depth" min="0" max="0" step="1" value="0" aria-label="Depth" />
+      </div>
+      <div class="ctl">
+        <div class="row">
+          <span class="name">Time</span>
+          <span style="display:flex; align-items:center; gap:8px">
+            <button class="play" id="play" type="button" title="Play time animation" aria-label="Play time animation">▶</button>
+            <span class="val" id="time-val">—</span>
+          </span>
+        </div>
+        <input type="range" id="time" min="0" max="0" step="1" value="0" aria-label="Time" />
+      </div>
+
+      <div class="switch">
+        <span class="name">Instruments</span>
+        <input type="checkbox" id="show-instruments" checked />
+        <label class="track" for="show-instruments" aria-label="Toggle instruments"></label>
+      </div>
+
+      <div class="switch">
+        <span class="name">Mesh grid</span>
+        <input type="checkbox" id="show-grid" checked />
+        <label class="track" for="show-grid" aria-label="Toggle data mesh grid"></label>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="ctl">
+        <div class="row"><span class="name">Layer opacity</span><span class="val" id="opacity-val">100%</span></div>
+        <input type="range" id="opacity" min="15" max="100" step="1" value="100" aria-label="Layer opacity" />
+      </div>
+
+      <div class="ctl">
+        <div class="row"><span class="name">Palette</span></div>
+        <select id="palette" class="sel" aria-label="Colour palette">
+          <option value="neon">Neon (default)</option>
+          <option value="ice">Ice</option>
+          <option value="viridis">Viridis</option>
+          <option value="thermal">Thermal</option>
+        </select>
+      </div>
+
+      <div class="ctl">
+        <div class="row"><span class="name">Scale</span></div>
+        <div class="seg seg-sm" id="scale" role="tablist" aria-label="Colour scale">
+          <button type="button" data-scale="linear" class="active">Linear</button>
+          <button type="button" data-scale="log">Log</button>
+        </div>
+      </div>
+
+      <div class="ctl">
+        <div class="row"><span class="name">Range</span><button class="linklike" id="range-auto" type="button">Auto</button></div>
+        <div class="range-row">
+          <input type="number" id="range-min" class="num" step="any" inputmode="decimal" aria-label="Colour scale minimum" />
+          <span class="num-sep">–</span>
+          <input type="number" id="range-max" class="num" step="any" inputmode="decimal" aria-label="Colour scale maximum" />
+        </div>
+      </div>
+
+      <div class="hint">Drag to orbit, scroll to zoom, click a float.</div>
+      <div class="status" id="status"></div>
+    </div>
+
+    <div id="legend" class="glass">
+      <div class="lg-head"><span class="lg-var" id="lg-var">—</span><span class="lg-units" id="lg-units"></span></div>
+      <div class="lg-bar" id="lg-bar"></div>
+      <div class="lg-scale"><span id="lg-min">–</span><span id="lg-mid">–</span><span id="lg-max">–</span></div>
+    </div>
+
+    <div id="profile" class="glass">
+      <div class="p-head">
+        <div>
+          <h2 id="p-name">—</h2>
+          <div class="p-kind" id="p-kind"></div>
+        </div>
+        <button class="p-close" id="p-close" title="Close" aria-label="Close">×</button>
+      </div>
+      <div class="p-meta" id="p-meta"></div>
+      <div class="p-vars" id="p-vars"></div>
+      <canvas id="p-chart"></canvas>
+    </div>
+
+    <!-- If the ES module fails (e.g. CDN blocked), surface it in the panel. -->
+    <script>
+      window.addEventListener('error', (e) => {
+        if (String(e.message || '').includes('import') || e.filename?.includes('unpkg')) {
+          document.getElementById('cdn-warn').style.display = 'block';
+        }
+      });
+    </script>
+
+    <script type="module">
+      import * as THREE from 'three';
+      import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+      const DEG2RAD = Math.PI / 180;
+      const R = 100;                    // globe radius (scene units)
+
+      // --- neon holographic colormap --------------------------------------
+      // These ramps are built to READ ACCURATELY: luminance rises monotonically
+      // with value (darker = colder/deeper, brighter = warmer/shallower), so the
+      // eye reads magnitude from brightness the way a scientific map should —
+      // instead of a rainbow whose hue jumps invent false boundaries. They stay
+      // in the cool cyan family (the holographic brand): no warm yellow/red in
+      // the defaults. The active palette drives BOTH the globe vertex colours and
+      // the legend gradient, so they always stay in sync.
+      const PALETTES = {
+        // Default: electric abyssal ramp. Deep indigo → blue → cyan → aqua →
+        // pale mint-white. Vivid and holographic, yet smooth and legible.
+        neon: [
+          [0.0,  [0.055, 0.075, 0.240]], [0.22, [0.086, 0.235, 0.660]],
+          [0.44, [0.078, 0.470, 0.920]], [0.64, [0.129, 0.740, 0.960]],
+          [0.83, [0.420, 0.920, 0.930]], [1.0,  [0.860, 1.000, 0.950]],
+        ],
+        // Cooler, more neutral sibling: near-black navy → blue → cyan → white.
+        ice: [
+          [0.0, [0.020, 0.040, 0.120]], [0.34, [0.050, 0.290, 0.580]],
+          [0.63, [0.102, 0.710, 0.900]], [0.84, [0.560, 0.920, 0.980]],
+          [1.0, [0.930, 0.990, 1.000]],
+        ],
+        // Perceptually-uniform scientific ramp forecasters expect.
+        viridis: [
+          [0.0, [0.267, 0.005, 0.329]], [0.25, [0.275, 0.196, 0.498]],
+          [0.5, [0.129, 0.567, 0.551]], [0.75, [0.369, 0.788, 0.383]],
+          [1.0, [0.993, 0.906, 0.144]],
+        ],
+        // Classic blue→cyan→yellow→red thermal ramp (opt-in, not the default).
+        thermal: [
+          [0.0, [0.031, 0.094, 0.282]], [0.35, [0.055, 0.353, 0.850]],
+          [0.55, [0.102, 0.800, 0.918]], [0.78, [0.980, 0.851, 0.200]],
+          [1.0, [0.902, 0.161, 0.118]],
+        ],
+      };
+      let activeStops = PALETTES.neon;
+      const clamp01 = (t) => Math.max(0, Math.min(1, t));
+      function colormap(t, stops) {
+        stops = stops || activeStops;
+        t = clamp01(t);
+        for (let i = 1; i < stops.length; i++) {
+          const [t1, c1] = stops[i];
+          if (t <= t1) {
+            const [t0, c0] = stops[i - 1];
+            const f = (t - t0) / (t1 - t0 || 1);
+            return [c0[0]+(c1[0]-c0[0])*f, c0[1]+(c1[1]-c0[1])*f, c0[2]+(c1[2]-c0[2])*f];
+          }
+        }
+        return stops[stops.length - 1][1];
+      }
+      const cssColor = (t, stops) => { const [r,g,b] = colormap(t, stops); return `rgb(${r*255|0},${g*255|0},${b*255|0})`; };
+
+      // --- colorbar state: palette + scale + manual range ------------------
+      // What the colorbar editor drives. `norm` maps a value to [0,1] for the
+      // active scale; log guards non-positive values (useful once BGC fields
+      // like chlorophyll arrive, which span orders of magnitude).
+      let scaleMode = 'linear';       // 'linear' | 'log'
+      let rangeOverride = null;       // {min,max} when the user pins a range
+      let lastField = null;           // most recent slice, for recolour w/o refetch
+      let displayRange = null;        // {min,max} of the data currently on screen
+      function norm(v, lo, hi) {
+        if (scaleMode === 'log') {
+          const a = Math.max(lo, 1e-6), b = Math.max(hi, a * 1.0001);
+          return (Math.log(Math.max(v, a)) - Math.log(a)) / (Math.log(b) - Math.log(a));
+        }
+        return (v - lo) / ((hi - lo) || 1);
+      }
+
+      // lat/lon (degrees) -> position on a sphere of radius r. Used for BOTH the
+      // data mesh and the coastlines so they register exactly.
+      function llToVec3(lat, lon, r) {
+        const phi = (90 - lat) * DEG2RAD;      // polar angle from +Y (north pole)
+        const theta = (lon + 180) * DEG2RAD;   // azimuth around +Y
+        return new THREE.Vector3(
+          -r * Math.sin(phi) * Math.cos(theta),
+           r * Math.cos(phi),
+           r * Math.sin(phi) * Math.sin(theta)
+        );
+      }
+
+      // --- scene ------------------------------------------------------------
+      const container = document.getElementById('viewport');
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x05070d);
+
+      const camera = new THREE.PerspectiveCamera(40, innerWidth/innerHeight, 0.1, 5000);
+      // Open facing the data: the INCOIS field covers the Indian Ocean, so aim
+      // the camera there (not the empty Pacific), framed a touch north so the
+      // field fans into the open lower-right, clear of the control panel.
+      camera.position.copy(llToVec3(12, 68, 300));
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(devicePixelRatio);
+      renderer.setSize(innerWidth, innerHeight);
+      container.appendChild(renderer.domElement);
+
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true; controls.dampingFactor = 0.08;
+      controls.enablePan = false;
+      controls.minDistance = 150; controls.maxDistance = 900;
+      controls.rotateSpeed = 0.6; controls.zoomSpeed = 0.8;
+
+      // No directional light: the mesh uses an unlit (MeshBasicMaterial) surface
+      // so temperature colours read true everywhere. A sun/terminator would
+      // darken half the globe and misrepresent the data on the shaded side.
+
+      // Everything geo-referenced lives in `globe`, which slowly auto-spins.
+      const globe = new THREE.Group();
+      scene.add(globe);
+
+      // Holographic scan grid: faint cyan meridians + parallels, floating just
+      // above the surface. This is the "projected" lat/lon lattice that reads as
+      // a hologram rather than a photo.
+      (function addHoloGrid() {
+        const segs = [];
+        const push = (la1, lo1, la2, lo2) => {
+          const a = llToVec3(la1, lo1, R * 1.012), b = llToVec3(la2, lo2, R * 1.012);
+          segs.push(a.x, a.y, a.z, b.x, b.y, b.z);
+        };
+        // Meridians every 20°, parallels every 20°, finely subdivided so they
+        // curve smoothly around the sphere.
+        for (let lon = -180; lon < 180; lon += 20)
+          for (let la = -80; la < 80; la += 4) push(la, lon, la + 4, lon);
+        for (let la = -80; la <= 80; la += 20)
+          for (let lo = -180; lo < 180; lo += 4) push(la, lo, la, lo + 4);
+        const g = new THREE.BufferGeometry();
+        g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(segs), 3));
+        globe.add(new THREE.LineSegments(g, new THREE.LineBasicMaterial({
+          color: 0x1ea8c4, transparent: true, opacity: 0.14,
+          blending: THREE.AdditiveBlending, depthWrite: false,
+        })));
+      })();
+
+      // --- starfield --------------------------------------------------------
+      (function addStars() {
+        const n = 2600, pos = new Float32Array(n * 3);
+        for (let i = 0; i < n; i++) {
+          const u = Math.random() * 2 - 1, a = Math.random() * Math.PI * 2;
+          const rr = Math.sqrt(1 - u * u), rad = 700 + Math.random() * 900;
+          pos[i*3] = rad*rr*Math.cos(a); pos[i*3+1] = rad*u; pos[i*3+2] = rad*rr*Math.sin(a);
+        }
+        const g = new THREE.BufferGeometry();
+        g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+        scene.add(new THREE.Points(g, new THREE.PointsMaterial({ color: 0xbcd0e6, size: 1.4, sizeAttenuation: true })));
+      })();
+
+      // --- atmosphere rim-glow ---------------------------------------------
+      (function addAtmosphere() {
+        const mat = new THREE.ShaderMaterial({
+          uniforms: {},
+          vertexShader: `
+            varying vec3 vNormal;
+            void main() {
+              vNormal = normalize(normalMatrix * normal);
+              gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            }`,
+          fragmentShader: `
+            varying vec3 vNormal;
+            void main() {
+              float intensity = pow(0.70 - dot(vNormal, vec3(0.0, 0.0, 1.0)), 3.0);
+              // Cyan holographic rim.
+              gl_FragColor = vec4(0.18, 0.85, 1.0, 1.0) * clamp(intensity, 0.0, 1.0);
+            }`,
+          side: THREE.BackSide, blending: THREE.AdditiveBlending,
+          transparent: true, depthWrite: false,
+        });
+        scene.add(new THREE.Mesh(new THREE.SphereGeometry(R * 1.18, 64, 64), mat));
+      })();
+
+      // --- base globe: a dark sphere just inside the data shell ------------
+      // Gives the data layer something to fade against: as Layer-opacity drops,
+      // the glowing field dissolves to reveal this bare holographic globe (and
+      // its coastlines) rather than empty space showing through the near side.
+      (function addBaseGlobe() {
+        const mat = new THREE.MeshBasicMaterial({ color: 0x07131f, side: THREE.FrontSide });
+        globe.add(new THREE.Mesh(new THREE.SphereGeometry(R * 0.995, 96, 96), mat));
+      })();
+
+      // --- land/ocean mask (authoritative, coastline-registered) -----------
+      // The holographic globe draws glowing ocean DATA over the sea and lets the
+      // continents recede as dark silhouettes. Land/ocean classification comes
+      // from the SAME Natural Earth land-110m polygons that draw the neon
+      // coastline, rasterised once (via d3-geo) into an equirectangular alpha
+      // mask. Sampling that mask — rather than a colour photo — guarantees the
+      // dark land registers exactly with the shoreline and never mistakes deep
+      // open ocean for land.
+      const LAND_TOPO_URL = 'https://cdn.jsdelivr.net/npm/world-atlas@2/land-110m.json';
+      let landTopoFeatures = null;         // cached GeoJSON features (reused by coastlines)
+      let landMaskData = null, landMaskW = 0, landMaskH = 0;   // Uint8 alpha
+      let earthReady = false;
+
+      async function loadEarthMaps() {
+        try {
+          const topo = await (await fetch(LAND_TOPO_URL)).json();
+          const [topojson, d3geo] = await Promise.all([
+            import('https://esm.sh/topojson-client@3'),
+            import('https://esm.sh/d3-geo@3'),
+          ]);
+          const fc = topojson.feature(topo, topo.objects.land);
+          landTopoFeatures = fc.type === 'FeatureCollection' ? fc.features : [fc];
+
+          // Rasterise land into an equirectangular canvas using d3-geo's path
+          // generator. d3.geoPath handles the sphere correctly — antimeridian
+          // cutting, polar caps (Antarctica), winding — so the fill can't bleed
+          // across the globe the way naive moveTo/lineTo in pixel space does.
+          const w = 1440, h = 720;                 // 0.25° per pixel
+          const cv = document.createElement('canvas');
+          cv.width = w; cv.height = h;
+          const cx = cv.getContext('2d', { willReadFrequently: true });
+          cx.fillStyle = '#000'; cx.fillRect(0, 0, w, h);
+          // Equirectangular projection mapping [-180,180]×[90,-90] onto the canvas.
+          const projection = d3geo.geoEquirectangular()
+            .scale(w / (2 * Math.PI))
+            .translate([w / 2, h / 2]);
+          const path = d3geo.geoPath(projection, cx);
+          cx.fillStyle = '#fff';
+          cx.beginPath();
+          path({ type: 'FeatureCollection', features: landTopoFeatures });
+          cx.fill();
+
+          const img = cx.getImageData(0, 0, w, h).data;
+          const mask = new Uint8Array(w * h);
+          for (let k = 0; k < mask.length; k++) mask[k] = img[k * 4] > 127 ? 1 : 0;
+          landMaskData = mask; landMaskW = w; landMaskH = h;
+          earthReady = true;
+        } catch (e) {
+          console.warn('land map unavailable — ocean-only globe:', e);
+          earthReady = false;
+        }
+      }
+      // Land test: sample the rasterised polygon mask at this lat/lon.
+      function _isLand(lat, lon) {
+        if (!landMaskData) return false;
+        let x = Math.floor(((lon + 180) / 360) * landMaskW);
+        let y = Math.floor(((90 - lat) / 180) * landMaskH);
+        x = Math.max(0, Math.min(landMaskW - 1, x));
+        y = Math.max(0, Math.min(landMaskH - 1, y));
+        return landMaskData[y * landMaskW + x] === 1;
+      }
+
+      // --- data globe: a data-driven field layer, resolution-independent -----
+      // The ocean field is a per-cell DataTexture mapped onto a lat/lon sphere and
+      // sampled with BILINEAR filtering, so colour is interpolated per-fragment
+      // (smooth) instead of per-vertex (faceted) — and the data mask lives in the
+      // texture's alpha, which the same filtering turns into a soft, anti-aliased
+      // data coastline instead of a blocky 1° staircase. A procedural grid drawn
+      // at the true data-cell boundaries gives it the crisp "scientific field"
+      // read the raw slice lacks. One geometry + one texture, rebuilt only when
+      // the grid dimensions change.
+      let dataMesh = null, fieldTex = null, fieldTexData = null, builtDims = null;
+      let layerOpacity = 1;  // 0..1 from the Layer-opacity slider (shader uniform)
+      let gridOn = true;     // Mesh-grid toggle
+      const GRID_STRENGTH = 0.16;   // subtle by default; dialled in-shader
+
+      // Field shader: sample the cell texture (bilinear), draw a hairline grid at
+      // cell edges (screen-space width via fwidth, faded out once cells go
+      // sub-pixel to kill moiré), and carry the data mask + layer opacity in alpha.
+      const FIELD_VERT = `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }`;
+      const FIELD_FRAG = `
+        precision highp float;
+        uniform sampler2D uTex;
+        uniform vec2  uDims;
+        uniform float uOpacity;
+        uniform float uGrid;
+        uniform vec3  uGridColor;
+        varying vec2 vUv;
+        void main() {
+          vec4 texel = texture2D(uTex, vUv);
+          if (texel.a < 0.02) discard;                 // land / no-data → bare globe
+          vec3 col = texel.rgb;
+          if (uGrid > 0.0) {
+            vec2 c  = vUv * uDims;                      // cell coordinates
+            vec2 d  = 0.5 - abs(fract(c) - 0.5);        // dist to nearest cell edge
+            vec2 fw = fwidth(c) * 1.2;                  // ~1px, zoom-independent
+            vec2 ln = 1.0 - smoothstep(vec2(0.0), fw, d);
+            float line = max(ln.x, ln.y);
+            float fade = 1.0 - smoothstep(0.35, 0.8, max(fw.x, fw.y));
+            col = mix(col, uGridColor, line * uGrid * fade * texel.a);
+          }
+          gl_FragColor = vec4(col, texel.a * uOpacity);
+        }`;
+
+      function ensureGlobe(field) {
+        const { lat, lon } = field, nlat = lat.length, nlon = lon.length;
+        if (dataMesh && builtDims && builtDims[0] === nlat && builtDims[1] === nlon) return;
+        if (dataMesh) {
+          globe.remove(dataMesh);
+          dataMesh.geometry.dispose(); dataMesh.material.dispose();
+          if (fieldTex) fieldTex.dispose();
+        }
+
+        const positions = new Float32Array(nlat*nlon*3);
+        const uvs       = new Float32Array(nlat*nlon*2);
+        let p = 0, u = 0;
+        for (let j = 0; j < nlat; j++) for (let i = 0; i < nlon; i++) {
+          // Vertices sit on one smooth sphere (no radial lift, so isolated cells
+          // can't spike at the limb). UV points at this cell's texel centre.
+          const v = llToVec3(lat[j], lon[i], R);
+          positions[p] = v.x; positions[p+1] = v.y; positions[p+2] = v.z;
+          uvs[u] = (i + 0.5) / nlon; uvs[u+1] = (j + 0.5) / nlat;
+          p += 3; u += 2;
+        }
+        // Triangulate WITHOUT wrapping longitude: the dropped seam column sits at
+        // the antimeridian (empty Pacific for this dataset) where a wrapped quad
+        // would smear the texture across the whole width. CCW from outside so
+        // FrontSide culls the far hemisphere.
+        const index = [];
+        for (let j = 0; j < nlat - 1; j++) for (let i = 0; i < nlon - 1; i++) {
+          const a = j*nlon+i, b = j*nlon+i+1, c = (j+1)*nlon+i, d = (j+1)*nlon+i+1;
+          index.push(a, b, c, b, d, c);
+        }
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+        geo.setIndex(index);
+
+        fieldTexData = new Uint8Array(nlat*nlon*4);
+        fieldTex = new THREE.DataTexture(fieldTexData, nlon, nlat, THREE.RGBAFormat);
+        fieldTex.magFilter = THREE.LinearFilter;
+        fieldTex.minFilter = THREE.LinearFilter;
+        fieldTex.wrapS = THREE.ClampToEdgeWrapping;
+        fieldTex.wrapT = THREE.ClampToEdgeWrapping;
+        fieldTex.generateMipmaps = false;
+
+        const mat = new THREE.ShaderMaterial({
+          uniforms: {
+            uTex:       { value: fieldTex },
+            uDims:      { value: new THREE.Vector2(nlon, nlat) },
+            uOpacity:   { value: layerOpacity },
+            uGrid:      { value: gridOn ? GRID_STRENGTH : 0 },
+            uGridColor: { value: new THREE.Color(0.72, 0.94, 1.0) },
+          },
+          vertexShader: FIELD_VERT,
+          fragmentShader: FIELD_FRAG,
+          transparent: true,
+          depthWrite: false,
+          side: THREE.FrontSide,
+        });
+        mat.extensions = { derivatives: true };   // fwidth() in WebGL1 contexts
+        dataMesh = new THREE.Mesh(geo, mat);
+        globe.add(dataMesh);
+        builtDims = [nlat, nlon];
+      }
+
+      function applyColors(field) {
+        lastField = field;
+        const { values } = field;
+        // Colour on the effective range (manual pin, else the on-screen range)
+        // honouring the active palette + linear/log scale. The INCOIS product is
+        // ocean-only, so a null cell IS land or an analysis gap → alpha 0, and the
+        // bare holographic globe + neon coastline show through (no land mask
+        // needed; masking by a coarse 1° coastline only punched blocky holes in
+        // real coastal data).
+        const [lo, hi] = effRange();
+        const nlat = field.lat.length, nlon = field.lon.length;
+        const data = fieldTexData;
+        let p = 0;
+        for (let j = 0; j < nlat; j++) for (let i = 0; i < nlon; i++) {
+          let r = 0, g = 0, b = 0, a = 0;
+          const v = values[j][i];
+          if (v != null) {
+            const c = colormap(norm(v, lo, hi));
+            r = c[0]*255; g = c[1]*255; b = c[2]*255; a = 255;
+          }
+          data[p] = r; data[p+1] = g; data[p+2] = b; data[p+3] = a;
+          p += 4;
+        }
+        // Fill no-data holes so the field reads as a continuous scientific
+        // surface instead of hard black rectangles. Iterative morphological
+        // fill: each pass turns a transparent cell opaque (rgb = mean of its
+        // opaque 8-neighbours) once it has >= FILL_THRESH of them. A high
+        // threshold closes concave holes and coastal notches quickly while the
+        // convex open-ocean boundary barely grows, so its soft bilinear edge
+        // survives and data doesn't bleed across the empty basins. Filled cells
+        // count as opaque next pass, so holes erode inward a ring at a time.
+        const FILL_THRESH = 5, FILL_PASSES = 8;
+        const fill = [];
+        for (let pass = 0; pass < FILL_PASSES; pass++) {
+          fill.length = 0;
+          for (let j = 0; j < nlat; j++) for (let i = 0; i < nlon; i++) {
+            const idx = (j*nlon+i)*4;
+            if (data[idx+3] !== 0) continue;
+            let rr = 0, gg = 0, bb = 0, n = 0;
+            for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
+              if (!dj && !di) continue;
+              const jj = j+dj, ii = i+di;
+              if (jj < 0 || jj >= nlat || ii < 0 || ii >= nlon) continue;
+              const k = (jj*nlon+ii)*4;
+              if (data[k+3] === 255) { rr += data[k]; gg += data[k+1]; bb += data[k+2]; n++; }
+            }
+            if (n >= FILL_THRESH) fill.push(idx, rr/n|0, gg/n|0, bb/n|0);
+          }
+          if (!fill.length) break;
+          for (let f = 0; f < fill.length; f += 4) {
+            const idx = fill[f];
+            data[idx] = fill[f+1]; data[idx+1] = fill[f+2]; data[idx+2] = fill[f+3]; data[idx+3] = 255;
+          }
+        }
+        // Soft edge: bleed colour one cell into the still-transparent boundary
+        // (rgb only, alpha stays 0) so bilinear filtering fades hue-true to
+        // transparent at the true data edge instead of dragging toward black.
+        for (let j = 0; j < nlat; j++) for (let i = 0; i < nlon; i++) {
+          const idx = (j*nlon+i)*4;
+          if (data[idx+3] !== 0) continue;
+          let rr = 0, gg = 0, bb = 0, n = 0;
+          for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
+            if (!dj && !di) continue;
+            const jj = j+dj, ii = i+di;
+            if (jj < 0 || jj >= nlat || ii < 0 || ii >= nlon) continue;
+            const k = (jj*nlon+ii)*4;
+            if (data[k+3] === 255) { rr += data[k]; gg += data[k+1]; bb += data[k+2]; n++; }
+          }
+          if (n) { data[idx] = rr/n|0; data[idx+1] = gg/n|0; data[idx+2] = bb/n|0; }
+        }
+        fieldTex.needsUpdate = true;
+      }
+
+      // --- coastlines (real continents) with a graticule fallback -----------
+      function addGraticule() {
+        const segs = [];
+        const push = (la1,lo1,la2,lo2) => {
+          const a = llToVec3(la1,lo1,R*1.004), b = llToVec3(la2,lo2,R*1.004);
+          segs.push(a.x,a.y,a.z, b.x,b.y,b.z);
+        };
+        for (let lon = -180; lon < 180; lon += 30) for (let la = -87; la < 87; la += 3) push(la,lon,la+3,lon);
+        for (let la = -60; la <= 60; la += 30) for (let lo = -180; lo < 180; lo += 3) push(la,lo,la,lo+3);
+        const g = new THREE.BufferGeometry();
+        g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(segs), 3));
+        globe.add(new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0x2b4257, transparent: true, opacity: 0.5 })));
+      }
+
+      async function addCoastlines() {
+        try {
+          // Reuse the polygons already loaded for the land mask (loadEarthMaps
+          // runs first); fall back to fetching if that step was skipped.
+          let features = landTopoFeatures;
+          if (!features) {
+            const topo = await (await fetch(LAND_TOPO_URL)).json();
+            const topojson = await import('https://esm.sh/topojson-client@3');
+            const fc = topojson.feature(topo, topo.objects.land);
+            features = fc.type === 'FeatureCollection' ? fc.features : [fc];
+          }
+          const segs = [];
+          const addRing = (ring) => {
+            for (let k = 0; k < ring.length - 1; k++) {
+              // Hug the surface (land + ocean share radius R now) so the neon
+              // shoreline traces the coast crisply without floating off it.
+              const a = llToVec3(ring[k][1], ring[k][0], R*1.0015);
+              const b = llToVec3(ring[k+1][1], ring[k+1][0], R*1.0015);
+              segs.push(a.x,a.y,a.z, b.x,b.y,b.z);
+            }
+          };
+          for (const feat of features) {
+            const geom = feat.geometry;
+            if (!geom) continue;
+            const polys = geom.type === 'MultiPolygon' ? geom.coordinates
+                        : geom.type === 'Polygon' ? [geom.coordinates] : [];
+            for (const poly of polys) for (const ring of poly) addRing(ring);
+          }
+          const g = new THREE.BufferGeometry();
+          g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(segs), 3));
+          // Neon coastal outline — the glowing edge that defines the hologram
+          // and makes the low-poly land silhouette read as a crisp continent.
+          // Drawn as a wide additive bloom + a bright near-white core line.
+          g.computeBoundingSphere();
+          const bloom = new THREE.LineSegments(g, new THREE.LineBasicMaterial({
+            color: 0x35d9ff, transparent: true, opacity: 0.5,
+            blending: THREE.AdditiveBlending, depthWrite: false,
+          }));
+          const core = new THREE.LineSegments(g, new THREE.LineBasicMaterial({
+            color: 0xd6fdff, transparent: true, opacity: 1.0,
+            blending: THREE.AdditiveBlending, depthWrite: false,
+          }));
+          globe.add(bloom);
+          globe.add(core);
+        } catch (e) {
+          console.warn('coastlines unavailable — drawing graticule instead:', e);
+          addGraticule();
+        }
+      }
+
+      // --- instrument markers ----------------------------------------------
+      // Markers live inside `globe` so they spin/orbit locked to their coords.
+      const markerGroup = new THREE.Group();
+      globe.add(markerGroup);
+      // One cohesive marker treatment (all instruments here are Argo). Colours
+      // pull from the UI accent palette so markers read as part of the same
+      // design language as the panel and colorbar.
+      const KIND_COLOR = { argo: 0x7fe3ff, glider: 0xffd27f, ctd: 0xff9d9d };
+      const markerCoreGeo = new THREE.SphereGeometry(1.5, 14, 14);
+      let markerMeshes = [];        // pickable meshes (raycast targets)
+      let selectedMarker = null;
+
+      // Soft radial glow sprite so beacons stand out over land AND ocean
+      // without a light. Drawn once to a canvas, reused as an additive texture.
+      const glowTexture = (() => {
+        const s = 64, cv = document.createElement('canvas');
+        cv.width = cv.height = s;
+        const cx = cv.getContext('2d');
+        const g = cx.createRadialGradient(s/2, s/2, 0, s/2, s/2, s/2);
+        g.addColorStop(0.0, 'rgba(255,255,255,1)');
+        g.addColorStop(0.35, 'rgba(190,235,255,0.7)');
+        g.addColorStop(1.0, 'rgba(120,200,255,0)');
+        cx.fillStyle = g; cx.fillRect(0, 0, s, s);
+        const tex = new THREE.CanvasTexture(cv);
+        tex.colorSpace = THREE.SRGBColorSpace;
+        return tex;
+      })();
+
+      // Tiny automation/QA hook (used by preview tests, not by the app itself):
+      // orient the camera to a lon/lat, and inspect/drive the instrument markers.
+      window.__aquaviz = {
+        faceLonLat(lon, lat) {
+          spinning = false;
+          globe.rotation.y = 0;
+          const v = llToVec3(lat, lon, 1).normalize();
+          const d = camera.position.length();
+          camera.position.set(v.x * d, v.y * d, v.z * d);
+          controls.update();
+        },
+        markerCount: () => markerMeshes.length,
+        // Data-layer material state, so preview tests can assert the Layer-
+        // opacity control actually reached the mesh (it's closure-private).
+        layerState: () => dataMesh ? {
+          opacity: dataMesh.material.uniforms.uOpacity.value,
+          transparent: dataMesh.material.transparent,
+          grid: dataMesh.material.uniforms.uGrid.value,
+        } : null,
+        pickAt(lon, lat) {   // simulate a click on a marker by lon/lat
+          const inst = markerMeshes.find(m =>
+            m.userData.lon === lon && m.userData.lat === lat);
+          if (inst) { highlight(inst); openProfile(inst.userData); return inst.userData; }
+          return null;
+        },
+      };
+
+      function addInstruments(list) {
+        for (const inst of list) {
+          const color = KIND_COLOR[inst.kind] || 0x7fe3ff;
+          // Beacon = a bright solid core + an additive glow sprite behind it.
+          const core = new THREE.Mesh(
+            markerCoreGeo,
+            new THREE.MeshBasicMaterial({ color })
+          );
+          core.position.copy(llToVec3(inst.lat, inst.lon, R * 1.015));
+          core.userData = inst;
+
+          const glow = new THREE.Sprite(new THREE.SpriteMaterial({
+            map: glowTexture, color, transparent: true,
+            blending: THREE.AdditiveBlending, depthWrite: false, opacity: 0.75,
+          }));
+          glow.scale.setScalar(4.8);
+          core.add(glow);   // glow rides with the core
+
+          markerGroup.add(core);
+          markerMeshes.push(core);   // only the core is a raycast target
+        }
+      }
+
+      // Selection ring: a thin torus laid flat on the surface, tangent to the
+      // globe, that pulses around the chosen beacon.
+      const halo = new THREE.Mesh(
+        new THREE.TorusGeometry(3.4, 0.35, 12, 40),
+        new THREE.MeshBasicMaterial({
+          color: 0xffffff, transparent: true, opacity: 0.85,
+          blending: THREE.AdditiveBlending, depthWrite: false,
+        })
+      );
+      halo.visible = false;
+      markerGroup.add(halo);
+      const _up = new THREE.Vector3(0, 0, 1);
+      function highlight(mesh) {
+        selectedMarker = mesh;
+        if (mesh) {
+          halo.position.copy(mesh.position);
+          // Orient the ring so it lies tangent to the sphere (faces outward).
+          halo.quaternion.setFromUnitVectors(_up, mesh.position.clone().normalize());
+          halo.visible = true;
+        } else {
+          halo.visible = false;
+        }
+      }
+
+      // --- picking ----------------------------------------------------------
+      const raycaster = new THREE.Raycaster();
+      const pointer = new THREE.Vector2();
+      let downXY = null;
+      renderer.domElement.addEventListener('pointerdown', (e) => { downXY = [e.clientX, e.clientY]; });
+      renderer.domElement.addEventListener('pointerup', (e) => {
+        // Treat as a click only if the pointer barely moved (not an orbit drag).
+        if (!downXY) return;
+        const moved = Math.hypot(e.clientX - downXY[0], e.clientY - downXY[1]);
+        downXY = null;
+        if (moved > 6 || !markerMeshes.length) return;
+        pointer.x = (e.clientX / innerWidth) * 2 - 1;
+        pointer.y = -(e.clientY / innerHeight) * 2 + 1;
+        raycaster.setFromCamera(pointer, camera);
+        const hit = raycaster.intersectObjects(markerMeshes, false)[0];
+        if (hit) { highlight(hit.object); openProfile(hit.object.userData); }
+      });
+
+      // --- render loop (auto-spin, paused while the user drags) -------------
+      // Auto-spin is the one ambient motion; honour prefers-reduced-motion by
+      // starting still (and staying on the Indian Ocean data we opened facing).
+      const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+      let spinning = !reduceMotion;
+      controls.addEventListener('start', () => { spinning = false; });
+      controls.addEventListener('end',   () => { spinning = !reduceMotion; });
+      addEventListener('resize', () => {
+        camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+        renderer.setSize(innerWidth, innerHeight);
+      });
+      let haloPulse = 0;
+      (function animate() {
+        requestAnimationFrame(animate);
+        if (spinning) globe.rotation.y += 0.0008;
+        if (halo.visible && !reduceMotion) {
+          haloPulse += 0.06;
+          const s = 1 + 0.18 * Math.sin(haloPulse);
+          halo.scale.setScalar(s);
+          halo.material.opacity = 0.55 + 0.3 * (0.5 + 0.5 * Math.sin(haloPulse));
+        }
+        controls.update();
+        renderer.render(scene, camera);
+      })();
+
+      // Compact readout formatting for the legend + range placeholders: drop to
+      // 3 significant figures for very small/large magnitudes (e.g. chlorophyll),
+      // otherwise 2 decimals — so a scale never shows "12.00000001".
+      function fmtNum(x) {
+        const a = Math.abs(x);
+        if (a !== 0 && (a < 0.1 || a >= 1000)) return x.toPrecision(3);
+        return (Math.round(x * 100) / 100).toString();
+      }
+
+      function paintColorbar(min, max, units) {
+        // The gradient uses the ACTIVE palette (cssColor defaults to activeStops)
+        // so the legend always matches the globe's colours.
+        const stops = Array.from({length:24}, (_,i) => `${cssColor(i/23)} ${(i/23*100).toFixed(0)}%`).join(',');
+        document.getElementById('lg-bar').style.background = `linear-gradient(to right, ${stops})`;
+        // Midpoint honours the scale: geometric mean on log, arithmetic on linear.
+        const mid = scaleMode === 'log'
+          ? Math.sqrt(Math.max(min, 1e-6) * Math.max(max, 1e-6))
+          : (min + max) / 2;
+        document.getElementById('lg-min').textContent = fmtNum(min);
+        document.getElementById('lg-mid').textContent = fmtNum(mid);
+        document.getElementById('lg-max').textContent = fmtNum(max);
+        document.getElementById('lg-units').textContent = units;
+      }
+
+      // --- data wiring ------------------------------------------------------
+      const statusEl   = document.getElementById('status');
+      const datasetEl  = document.getElementById('dataset');
+      const regionEl   = document.getElementById('region');
+      const variableEl = document.getElementById('variable');   // segmented-control container
+      const lgVarEl    = document.getElementById('lg-var');
+      const depthEl    = document.getElementById('depth');
+      const depthValEl = document.getElementById('depth-val');
+      const timeEl     = document.getElementById('time');
+      const timeValEl  = document.getElementById('time-val');
+
+      // --- display-control refs (colorbar editor · opacity · time animation) --
+      const playEl       = document.getElementById('play');
+      const opacityEl    = document.getElementById('opacity');
+      const opacityValEl = document.getElementById('opacity-val');
+      const paletteEl    = document.getElementById('palette');
+      const scaleEl      = document.getElementById('scale');
+      const gridEl       = document.getElementById('show-grid');
+      const rangeMinEl   = document.getElementById('range-min');
+      const rangeMaxEl   = document.getElementById('range-max');
+      const rangeAutoEl  = document.getElementById('range-auto');
+
+      // Push the current layer opacity onto the field shader. The material is
+      // rebuilt only when the grid dimensions change; it initialises uOpacity
+      // from layerOpacity, so this just keeps the live slider in sync.
+      function applyOpacity() {
+        if (!dataMesh) return;
+        dataMesh.material.uniforms.uOpacity.value = layerOpacity;
+      }
+
+      // Opacity slider: dissolve the glowing field toward the bare dark globe.
+      opacityEl.addEventListener('input', () => {
+        layerOpacity = Number(opacityEl.value) / 100;
+        opacityValEl.textContent = `${opacityEl.value}%`;
+        applyOpacity();
+      });
+
+      // Palette selector: swap the active colormap; globe + legend both follow.
+      paletteEl.addEventListener('change', () => {
+        activeStops = PALETTES[paletteEl.value] || PALETTES.neon;
+        repaint();
+      });
+
+      // Mesh-grid toggle: show/hide the hairline data-cell grid on the field.
+      gridEl.addEventListener('change', () => {
+        gridOn = gridEl.checked;
+        if (dataMesh) dataMesh.material.uniforms.uGrid.value = gridOn ? GRID_STRENGTH : 0;
+      });
+
+      // Scale segmented control: linear ↔ log (log matters for fields that span
+      // orders of magnitude, e.g. chlorophyll once BGC data arrives).
+      for (const b of scaleEl.querySelectorAll('button')) {
+        b.addEventListener('click', () => {
+          scaleMode = b.dataset.scale;
+          for (const c of scaleEl.children) c.classList.toggle('active', c === b);
+          repaint();
+        });
+      }
+
+      // Manual min/max: pin the colour scale; blank or invalid falls back to auto.
+      function applyRangeFromInputs() {
+        const lo = parseFloat(rangeMinEl.value), hi = parseFloat(rangeMaxEl.value);
+        rangeOverride = (isFinite(lo) && isFinite(hi) && hi > lo) ? { min: lo, max: hi } : null;
+        repaint();
+      }
+      rangeMinEl.addEventListener('change', applyRangeFromInputs);
+      rangeMaxEl.addEventListener('change', applyRangeFromInputs);
+      rangeAutoEl.addEventListener('click', () => {
+        rangeOverride = null;
+        rangeMinEl.value = ''; rangeMaxEl.value = '';
+        repaint();
+      });
+
+      // Time animation: advance the time axis on a timer, wrapping at the end.
+      let playing = false, playTimer = null;
+      function setPlaying(on) {
+        playing = on && times.length > 1;
+        playEl.textContent = playing ? '⏸' : '▶';
+        if (playTimer) { clearInterval(playTimer); playTimer = null; }
+        if (playing) {
+          playTimer = setInterval(() => {
+            const n = Number(timeEl.value);
+            timeEl.value = String((n + 1) % times.length);
+            timeValEl.textContent = fmtTime(times[Number(timeEl.value)]);
+            loadSlice();
+            if (activeInst) drawProfile();
+          }, 950);
+        }
+      }
+      playEl.addEventListener('click', () => setPlaying(!playing));
+
+      // Human-friendly variable labels for the panel/heading.
+      let sourceName = 'synthetic';   // set from /meta/coords (may be blended)
+      const VAR_LABELS = {
+        temperature: 'Temperature',
+        salinity: 'Salinity',
+        current_speed: 'Current speed',
+      };
+
+      let depths = [];        // metres, from /meta/coords
+      let times = [];         // ISO-8601 strings
+      let variables = {};     // name -> { units, domain:{min,max} }
+      let current = 'temperature';
+      let reqSeq = 0;         // guards against out-of-order responses
+
+      const fmtTime = (iso) => (iso || '').slice(0, 10);   // YYYY-MM-DD
+
+      // Effective colour range, in priority order: a manual pin, else the range
+      // of the data actually on screen (so the full ramp is used and structure
+      // is visible — a single warm surface slice shows its own spatial detail,
+      // and the depth-stacked volume spans the whole cold-deep→warm-surface
+      // gradient because its min/max cover the column), else the variable's
+      // absolute domain, else a safe unit interval.
+      function effRange() {
+        if (rangeOverride) return [rangeOverride.min, rangeOverride.max];
+        if (displayRange && displayRange.min != null && displayRange.max != null)
+          return [displayRange.min, displayRange.max];
+        const v = variables[current];
+        if (v && v.domain) return [v.domain.min, v.domain.max];
+        return [0, 1];
+      }
+
+      // Paint the legend gradient + numeric ticks + range placeholders from the
+      // effective range. Split out so a freshly loaded slice/volume can refresh
+      // the legend to its own range (the colour scale follows what's shown).
+      function paintLegend() {
+        const [lo, hi] = effRange();
+        const units = (variables[current] && variables[current].units) || '';
+        paintColorbar(lo, hi, units);
+        if (!rangeOverride) {
+          rangeMinEl.placeholder = fmtNum(lo);
+          rangeMaxEl.placeholder = fmtNum(hi);
+        }
+      }
+
+      // Recolour the current slice + repaint the legend WITHOUT refetching — the
+      // fast path for palette / scale / range edits (data is already in hand).
+      function repaint() {
+        if (lastField) applyColors(lastField);
+        paintLegend();
+      }
+
+      // Switching variables drops any manual range and any stale on-screen range
+      // (so the legend shows the new variable's absolute domain until its first
+      // slice arrives, then rescales to that slice via loadSlice → paintLegend).
+      function refreshColorbar() {
+        rangeOverride = null;
+        displayRange = null;
+        rangeMinEl.value = ''; rangeMaxEl.value = '';
+        paintLegend();
+      }
+
+      async function loadSlice() {
+        const depth = depths[Number(depthEl.value)];
+        const time  = times[Number(timeEl.value)];
+        const seq = ++reqSeq;
+        depthValEl.textContent = `${depth} m`;
+        timeValEl.textContent = fmtTime(time);
+        statusEl.textContent = 'loading slice…';
+        try {
+          const url = `/field/${current}?depth=${depth}&time=${encodeURIComponent(time)}`;
+          const f = await (await fetch(url)).json();
+          // A slower earlier request must not overwrite a newer slice.
+          if (seq !== reqSeq) return;
+          // Colour to the data actually on screen so the whole ramp is used and
+          // this slice's spatial structure is legible (a warm surface layer
+          // spans only a sliver of the fixed column domain otherwise).
+          displayRange = { min: f.value_min, max: f.value_max };
+          ensureGlobe(f);
+          applyColors(f);
+          paintLegend();
+          statusEl.textContent =
+            `Slice range ${f.value_min}–${f.value_max} ${f.units}`;
+        } catch (e) {
+          if (seq !== reqSeq) return;
+          statusEl.innerHTML = `<span class="err">slice failed: ${e.message}</span>`;
+        }
+      }
+
+      function selectVariable(name) {
+        current = name;
+        // Reflect the active variable in the segmented control + legend title.
+        for (const b of variableEl.children) {
+          const on = b.dataset.var === name;
+          b.classList.toggle('active', on);
+          b.setAttribute('aria-selected', on ? 'true' : 'false');
+        }
+        lgVarEl.textContent = VAR_LABELS[name] || name;
+        refreshColorbar();   // rescale legend to the new variable's domain
+        loadSlice();
+      }
+
+      // --- instrument profile panel ----------------------------------------
+      const profileEl = document.getElementById('profile');
+      const KIND_LABEL = { argo: 'Argo float', glider: 'Glider', ctd: 'CTD cast' };
+      let profChart = null;
+      let activeInst = null;
+      let profVar = 'temperature';
+
+      document.getElementById('p-close').addEventListener('click', () => {
+        profileEl.classList.remove('open');
+        highlight(null);
+        activeInst = null;
+      });
+
+      async function drawProfile() {
+        if (!activeInst) return;
+        const time = times[Number(timeEl.value)];
+        const url = `/instruments/${activeInst.id}/profile?variable=${profVar}&time=${encodeURIComponent(time)}`;
+        let p;
+        try { p = await (await fetch(url)).json(); }
+        catch (e) { return; }
+        const latTxt = `${Math.abs(p.lat).toFixed(1)}°${p.lat >= 0 ? 'N' : 'S'}`;
+        const lonTxt = `${Math.abs(p.lon).toFixed(1)}°${p.lon >= 0 ? 'E' : 'W'}`;
+        document.getElementById('p-meta').innerHTML =
+          `<span class="p-coord">${latTxt}, ${lonTxt}</span><span class="p-date">${fmtTime(p.time)}</span>`;
+        // Depth increases downward: plot value on X, depth on Y (inverted).
+        const points = p.depths.map((d, i) => ({ x: p.values[i], y: d }));
+        // Neon palette, matching the globe colormap: warm magenta end for
+        // temperature, cool cyan for salinity (no off-theme orange/red).
+        const accent = profVar === 'salinity' ? '#4fc9ec' : '#f65fb8';
+        if (profChart) profChart.destroy();
+        profChart = new Chart(document.getElementById('p-chart'), {
+          type: 'line',
+          data: { datasets: [{
+            label: `${VAR_LABELS[profVar] || profVar} (${p.units})`,
+            data: points, borderColor: accent, backgroundColor: accent,
+            pointRadius: 2.5, tension: 0.3,
+          }]},
+          options: {
+            responsive: true, maintainAspectRatio: false,
+            plugins: { legend: { labels: { color: '#b7c6d4', boxWidth: 12, font: { size: 11 } } } },
+            scales: {
+              x: { type: 'linear', position: 'top', bounds: 'data',
+                   title: { display: true, text: p.units, color: '#8aa0b2' },
+                   ticks: { color: '#8aa0b2' }, grid: { color: 'rgba(120,150,180,0.12)' } },
+              y: { type: 'linear', reverse: true, min: 0,
+                   title: { display: true, text: 'Depth (m)', color: '#8aa0b2' },
+                   ticks: { color: '#8aa0b2' }, grid: { color: 'rgba(120,150,180,0.12)' } },
+            },
+          },
+        });
+      }
+
+      function openProfile(inst) {
+        activeInst = inst;
+        // Default to a variable this instrument actually reports.
+        if (!inst.variables.includes(profVar)) profVar = inst.variables[0];
+        document.getElementById('p-name').textContent = inst.name;
+        document.getElementById('p-kind').textContent = KIND_LABEL[inst.kind] || inst.kind;
+        // Variable toggle buttons.
+        const vars = document.getElementById('p-vars');
+        vars.innerHTML = '';
+        for (const v of inst.variables) {
+          const b = document.createElement('button');
+          b.textContent = VAR_LABELS[v] || v;
+          b.className = v === profVar ? 'active' : '';
+          b.addEventListener('click', () => {
+            profVar = v;
+            [...vars.children].forEach(c => c.classList.toggle('active', c === b));
+            drawProfile();
+          });
+          vars.appendChild(b);
+        }
+        profileEl.classList.add('open');
+        drawProfile();
+      }
+
+      // Keep an open profile in sync with the time scrubber.
+      timeEl.addEventListener('input', () => { if (activeInst) drawProfile(); });
+
+      // Instruments visibility toggle.
+      document.getElementById('show-instruments').addEventListener('change', (e) => {
+        markerGroup.visible = e.target.checked;
+        if (!e.target.checked) {
+          profileEl.classList.remove('open'); highlight(null); activeInst = null;
+        }
+      });
+
+      (async function init() {
+        addCoastlines();   // async, non-blocking — globe renders without waiting
+        // Load earth maps first so the very first slice already shows land.
+        // If they fail (network), the globe still renders ocean-only.
+        await loadEarthMaps();
+        try {
+          const coords = await (await fetch('/meta/coords')).json();
+          depths = coords.depths;
+          times = coords.times;
+          variables = coords.variables;   // { name: { units, domain } }
+          sourceName = coords.source || 'synthetic';
+
+          // Attribution: split a "Dataset · Region" source name into a clean
+          // dataset line + a region tag, so the UI never shows a dotted chain.
+          {
+            const parts = String(sourceName).split('·').map(s => s.trim());
+            datasetEl.textContent = parts[0] || 'synthetic';
+            if (parts[1]) { regionEl.textContent = parts[1]; regionEl.hidden = false; }
+            else { regionEl.hidden = true; }
+          }
+
+          // Build the segmented variable control from the catalogue.
+          variableEl.innerHTML = '';
+          for (const name of Object.keys(variables)) {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.dataset.var = name;
+            b.setAttribute('role', 'tab');
+            b.textContent = VAR_LABELS[name] || name;
+            b.addEventListener('click', () => selectVariable(name));
+            variableEl.appendChild(b);
+          }
+          if (!variables[current]) current = Object.keys(variables)[0];
+
+          // Depth + time sliders.
+          depthEl.max = String(depths.length - 1);
+          depthEl.addEventListener('input', loadSlice);
+          timeEl.max = String(Math.max(0, times.length - 1));
+          timeEl.addEventListener('input', loadSlice);
+          timeValEl.textContent = fmtTime(times[0]);
+          playEl.disabled = times.length <= 1;   // nothing to animate
+
+          selectVariable(current);
+
+          // Load instrument markers (non-blocking; globe already renders).
+          try {
+            const inst = await (await fetch('/instruments')).json();
+            addInstruments(inst.instruments);
+          } catch (e) {
+            console.warn('instruments unavailable:', e);
+          }
+        } catch (e) {
+          statusEl.innerHTML = `<span class="err">could not reach API: ${e.message}</span>`;
+        }
+      })();
+    </script>
+  </body>
+</html>
