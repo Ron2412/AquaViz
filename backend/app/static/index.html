@@ -261,6 +261,11 @@
       </div>
 
       <div class="ctl">
+        <div class="row"><span class="name">Vertical exaggeration</span><span class="val" id="exag-val">2.0×</span></div>
+        <input type="range" id="exag" min="1" max="6" step="0.1" value="2" aria-label="Vertical exaggeration" />
+      </div>
+
+      <div class="ctl">
         <div class="row"><span class="name">Palette</span></div>
         <select id="palette" class="sel" aria-label="Colour palette">
           <option value="neon">Neon (default)</option>
@@ -675,18 +680,21 @@
         builtDims = [nlat, nlon];
       }
 
-      function applyColors(field) {
-        lastField = field;
-        const { values } = field;
-        // Colour on the effective range (manual pin, else the on-screen range)
-        // honouring the active palette + linear/log scale. The INCOIS product is
-        // ocean-only, so a null cell IS land or an analysis gap → alpha 0, and the
-        // bare holographic globe + neon coastline show through (no land mask
-        // needed; masking by a coarse 1° coastline only punched blocky holes in
-        // real coastal data).
-        const [lo, hi] = effRange();
-        const nlat = field.lat.length, nlon = field.lon.length;
-        const data = fieldTexData;
+      // Rasterise a 2D scalar slice (values[j][i], null = no data) into an RGBA8
+      // texture buffer using the active palette/scale on [lo,hi], then close
+      // no-data holes so the field reads as a continuous scientific surface
+      // instead of hard black rectangles. Shared by the surface field and every
+      // depth shell so they render through the identical bilinear pipeline (same
+      // smoothing, same gap-fill) and stay perfectly in sync across depth.
+      //
+      // Iterative morphological fill: each pass turns a transparent cell opaque
+      // (rgb = mean of its opaque 8-neighbours) once it has >= FILL_THRESH of
+      // them. A high threshold closes concave holes and coastal notches quickly
+      // while the convex open-ocean boundary barely grows, so its soft bilinear
+      // edge survives and data doesn't bleed across the empty basins. Filled
+      // cells count as opaque next pass, so holes erode inward a ring at a time.
+      const FILL_THRESH = 5, FILL_PASSES = 8;
+      function rasterizeSlice(values, nlat, nlon, lo, hi, data) {
         let p = 0;
         for (let j = 0; j < nlat; j++) for (let i = 0; i < nlon; i++) {
           let r = 0, g = 0, b = 0, a = 0;
@@ -698,15 +706,6 @@
           data[p] = r; data[p+1] = g; data[p+2] = b; data[p+3] = a;
           p += 4;
         }
-        // Fill no-data holes so the field reads as a continuous scientific
-        // surface instead of hard black rectangles. Iterative morphological
-        // fill: each pass turns a transparent cell opaque (rgb = mean of its
-        // opaque 8-neighbours) once it has >= FILL_THRESH of them. A high
-        // threshold closes concave holes and coastal notches quickly while the
-        // convex open-ocean boundary barely grows, so its soft bilinear edge
-        // survives and data doesn't bleed across the empty basins. Filled cells
-        // count as opaque next pass, so holes erode inward a ring at a time.
-        const FILL_THRESH = 5, FILL_PASSES = 8;
         const fill = [];
         for (let pass = 0; pass < FILL_PASSES; pass++) {
           fill.length = 0;
@@ -745,7 +744,240 @@
           }
           if (n) { data[idx] = rr/n|0; data[idx+1] = gg/n|0; data[idx+2] = bb/n|0; }
         }
+      }
+
+      function applyColors(field) {
+        lastField = field;
+        const { values } = field;
+        // Colour on the effective range (manual pin, else the on-screen range)
+        // honouring the active palette + linear/log scale. The INCOIS product is
+        // ocean-only, so a null cell IS land or an analysis gap → alpha 0, and the
+        // bare holographic globe + neon coastline show through (no land mask
+        // needed; masking by a coarse 1° coastline only punched blocky holes in
+        // real coastal data).
+        const [lo, hi] = effRange();
+        const nlat = field.lat.length, nlon = field.lon.length;
+        rasterizeSlice(values, nlat, nlon, lo, hi, fieldTexData);
         fieldTex.needsUpdate = true;
+      }
+
+      // --- depth shells: the water column as concentric translucent caps -----
+      // The surface field (dataMesh, radius R) is the shallowest layer; deeper
+      // levels render as nested regional caps at shrinking radius, so depth is
+      // physically visible. Concentric transparent spheres can't be distance-
+      // sorted, so shells use ADDITIVE blending (order-independent, and on-theme
+      // with the holographic rim/coastlines). Colour (vertex RGB) is rewritten
+      // only on data/palette/scale/range change; per-shell opacity (depth fade ×
+      // layer opacity × focus) updates live with no recolour.
+      let shellGroup = null;        // THREE.Group holding the deeper-shell meshes
+      let shellMeshes = [];         // one Mesh per depth level > surface
+      let volumeData = null;        // last /volume payload (for repaintVolume)
+      let exaggeration = 2;         // vertical-exaggeration slider (1..6)
+      let focusDepth = 0;           // metres; depth slider emphasises this shell
+      let focusRange = null;        // {min,max} of the focused shell (drives the legend)
+      const SHELL_SPREAD = 0.34;    // max fractional radial pull-in at max depth
+      const SHELL_FLOOR = 0.55;     // deepest shell never shrinks past this ·R
+
+      // depth (m) -> fraction of R for this shell's radius. Exaggeration widens
+      // the spacing; sqrt compresses the crowded near-surface thermocline so the
+      // shallow shells don't overlap. Clamped so the stack stays inside [floor,1].
+      function radiusFrac(depth, maxDepth) {
+        const t = maxDepth > 0 ? Math.sqrt(depth / maxDepth) : 0;
+        const pull = SHELL_SPREAD * (exaggeration / 6) * t;
+        return Math.max(SHELL_FLOOR, 1 - pull);
+      }
+
+      // Build (or rebuild) the shell meshes from a /volume payload. One shared
+      // position + index buffer (unit sphere at R); each shell scales radially
+      // and carries its own RGBA colour attribute.
+      function ensureShells(vol) {
+        const { lat, lon, depths: zs } = vol;
+        const nlat = lat.length, nlon = lon.length;
+        // Rebuild geometry only when the grid or level count changes.
+        const sig = `${nlat}x${nlon}x${zs.length}`;
+        if (shellGroup && shellGroup.userData.sig === sig) return;
+
+        if (shellGroup) {
+          globe.remove(shellGroup);
+          for (const m of shellMeshes) {
+            m.geometry.dispose(); m.material.dispose();
+            if (m.userData.tex) m.userData.tex.dispose();
+          }
+          shellMeshes = [];
+        }
+        shellGroup = new THREE.Group();
+        shellGroup.userData.sig = sig;
+
+        // Shared vertex positions + UVs on the sphere at radius R (shells scale
+        // down). UVs point at each cell's texel centre so the shells sample their
+        // DataTexture exactly like the surface mesh does.
+        const positions = new Float32Array(nlat*nlon*3);
+        const uvs       = new Float32Array(nlat*nlon*2);
+        let p = 0, u = 0;
+        for (let j = 0; j < nlat; j++) for (let i = 0; i < nlon; i++) {
+          const v = llToVec3(lat[j], lon[i], R);
+          positions[p] = v.x; positions[p+1] = v.y; positions[p+2] = v.z; p += 3;
+          uvs[u] = (i + 0.5) / nlon; uvs[u+1] = (j + 0.5) / nlat; u += 2;
+        }
+        const posAttr = new THREE.BufferAttribute(positions, 3);
+        const uvAttr  = new THREE.BufferAttribute(uvs, 2);
+        // Non-wrapping triangulation, same rationale as the surface mesh.
+        const index = [];
+        for (let j = 0; j < nlat - 1; j++) for (let i = 0; i < nlon - 1; i++) {
+          const a = j*nlon+i, b = j*nlon+i+1, c = (j+1)*nlon+i, d = (j+1)*nlon+i+1;
+          index.push(a, b, c, b, d, c);
+        }
+
+        const maxDepth = zs[zs.length - 1];
+        // Skip level 0 (the surface) — the existing dataMesh already draws it.
+        // Each shell renders through the SAME bilinear field shader + DataTexture
+        // as the surface, so a focused deep layer is as smooth as the surface (no
+        // blocky per-vertex Gouraud shading) and every depth stays in sync. Grid
+        // lines are off on shells (uGrid 0) — the surface cap already draws the
+        // lattice; drawing it on every shell would moiré. Normal (not additive)
+        // blending so cold/dark deep layers read true; the "one bright layer"
+        // focus model means the faint ghost shells don't need distance sorting.
+        for (let k = 1; k < zs.length; k++) {
+          const geo = new THREE.BufferGeometry();
+          geo.setAttribute('position', posAttr);           // shared
+          geo.setAttribute('uv', uvAttr);                  // shared
+          geo.setIndex(index);
+
+          const texData = new Uint8Array(nlat*nlon*4);
+          const tex = new THREE.DataTexture(texData, nlon, nlat, THREE.RGBAFormat);
+          tex.magFilter = THREE.LinearFilter;
+          tex.minFilter = THREE.LinearFilter;
+          tex.wrapS = THREE.ClampToEdgeWrapping;
+          tex.wrapT = THREE.ClampToEdgeWrapping;
+          tex.generateMipmaps = false;
+
+          const mat = new THREE.ShaderMaterial({
+            uniforms: {
+              uTex:       { value: tex },
+              uDims:      { value: new THREE.Vector2(nlon, nlat) },
+              uOpacity:   { value: 0 },        // set live by applyShellStyles
+              uGrid:      { value: 0 },        // no grid on shells (see above)
+              uGridColor: { value: new THREE.Color(0.72, 0.94, 1.0) },
+            },
+            vertexShader: FIELD_VERT,
+            fragmentShader: FIELD_FRAG,
+            transparent: true,
+            depthWrite: false,
+            side: THREE.FrontSide,
+            blending: THREE.NormalBlending,
+          });
+          mat.extensions = { derivatives: true };
+          const mesh = new THREE.Mesh(geo, mat);
+          mesh.scale.setScalar(radiusFrac(zs[k], maxDepth));
+          mesh.userData = { depth: zs[k], nlat, nlon, maxDepth, texData, tex };
+          shellGroup.add(mesh);
+          shellMeshes.push(mesh);
+        }
+        globe.add(shellGroup);
+      }
+
+      // Fill every shell's vertex-colour buffer from the volume slices. Because
+      // the focus model lights ONE shell at a time, each shell is coloured on its
+      // OWN slice min/max (not the whole column) so every layer uses the full
+      // bright ramp and its spatial structure is legible — a 900 m layer spans
+      // only ~2°C of the 28°C column, which would be a single flat dark band on a
+      // shared scale. A manual range pin still overrides. Each shell caches its
+      // range in userData so the legend can follow the focused layer. Alpha
+      // carries the data mask (0 = land/gap). Runs on data load + palette/scale/
+      // range change.
+      function repaintVolume() {
+        if (!volumeData || !shellMeshes.length) return;
+        const { slices } = volumeData;
+        for (let s = 0; s < shellMeshes.length; s++) {
+          const mesh = shellMeshes[s];
+          const level = slices[s + 1];                    // +1: shell s == depth level s+1
+          const { nlat, nlon, texData, tex } = mesh.userData;
+          // Per-slice range (or the manual pin if set).
+          let lo, hi;
+          if (rangeOverride) { lo = rangeOverride.min; hi = rangeOverride.max; }
+          else {
+            lo = Infinity; hi = -Infinity;
+            for (let j = 0; j < nlat; j++) for (let i = 0; i < nlon; i++) {
+              const v = level[j][i];
+              if (v != null) { if (v < lo) lo = v; if (v > hi) hi = v; }
+            }
+            if (!isFinite(lo)) { lo = 0; hi = 1; }
+          }
+          mesh.userData.range = { min: lo, max: hi };
+          // Same bilinear rasterise + gap-fill as the surface, into this shell's
+          // texture — so the shell is as smooth as the surface at every depth.
+          rasterizeSlice(level, nlat, nlon, lo, hi, texData);
+          tex.needsUpdate = true;
+        }
+        applyShellStyles();
+      }
+
+      // Live per-shell styling (no recolour): radius from exaggeration, plus a
+      // strong "one lit layer" focus model. Nested translucent spheres blend to
+      // haze if all shown equally, so instead the shell nearest the depth-slider
+      // focus glows bright and every other shell drops to a faint context ghost.
+      // Scrubbing depth then visibly swaps which layer is lit. The opaque surface
+      // cap (dataMesh) also fades as you dive so a focused deep shell shows
+      // through it rather than being occluded.
+      function applyShellStyles() {
+        if (!shellMeshes.length) return;
+        const surfaceDepth = (volumeData && volumeData.depths) ? volumeData.depths[0] : 5;
+        // The surface cap (dataMesh) is level 0 and a focusable layer too, so find
+        // the nearest layer across BOTH the surface and the deeper shells.
+        let nearest = null, best = Math.abs(surfaceDepth - focusDepth);  // surface as baseline
+        for (const m of shellMeshes) {
+          const d = Math.abs(m.userData.depth - focusDepth);
+          if (d < best) { best = d; nearest = m; }
+        }
+        const surfaceFocused = nearest === null;   // no shell beat the surface
+        for (const m of shellMeshes) {
+          const { depth, maxDepth } = m.userData;
+          m.scale.setScalar(radiusFrac(depth, maxDepth));
+          // Focused layer bright; others a dim ghost that fades with depth so the
+          // column still reads as a stack without muddying the lit layer.
+          const ghost = 0.10 * (1 - 0.5 * depth / maxDepth);
+          const base = (m === nearest) ? 0.92 : ghost;
+          // Shells use the field ShaderMaterial → opacity rides the uOpacity
+          // uniform (the shader multiplies it into the data-mask alpha).
+          m.material.uniforms.uOpacity.value = Math.min(1, base * layerOpacity);
+          m.renderOrder = (m === nearest) ? 2 : 1;
+        }
+        // Surface cap: bright when it's the focused layer, else a faint context
+        // shell so a lit deeper layer shows through instead of being occluded.
+        if (dataMesh) {
+          const surf = surfaceFocused ? 1 : 0.16;
+          dataMesh.material.uniforms.uOpacity.value = surf * layerOpacity;
+        }
+        // Each layer is coloured on its own range, so the legend follows the lit
+        // layer. Surface uses the on-screen slice range (displayRange); a deeper
+        // shell uses the range repaintVolume cached for it. Skip when the user
+        // pinned a manual range (effRange already honours that).
+        if (!rangeOverride) {
+          focusRange = (surfaceFocused || !nearest) ? null : (nearest.userData.range || null);
+          paintLegend();
+        }
+      }
+
+      async function loadVolume() {
+        const time = times[Number(timeEl.value)];
+        const seq = reqSeq;   // piggyback the slice guard set by loadSlice()
+        try {
+          // Fewer levels read as distinct strata instead of a dense fog; the
+          // depth slider then clearly swaps which layer is lit.
+          const url = `/volume/${current}?time=${encodeURIComponent(time)}&max_levels=6`;
+          const vol = await (await fetch(url)).json();
+          if (seq !== reqSeq) return;     // a newer request superseded us
+          volumeData = vol;
+          ensureShells(vol);
+          // Each shell is coloured on its own slice range (see repaintVolume), so
+          // don't force a whole-column range onto the surface — the surface keeps
+          // the slice range loadSlice already gave it. Paint the shells, then let
+          // applyShellStyles point the legend at whichever layer is focused.
+          repaintVolume();
+          applyShellStyles();
+        } catch (e) {
+          console.warn('volume unavailable:', e);
+        }
       }
 
       // --- coastlines (real continents) with a graticule fallback -----------
@@ -864,6 +1096,26 @@
             m.userData.lon === lon && m.userData.lat === lat);
           if (inst) { highlight(inst); openProfile(inst.userData); return inst.userData; }
           return null;
+        },
+        // Depth-shell introspection for preview tests.
+        shellCount: () => shellMeshes.length,
+        shellStyle: (i) => {
+          const m = shellMeshes[i];
+          return m ? { depth: m.userData.depth, radius: m.scale.x, opacity: m.material.uniforms.uOpacity.value } : null;
+        },
+        exaggeration: () => exaggeration,
+        focusDepth: () => focusDepth,
+        // Pitch the camera toward the limb (0 = straight-on, 90 = pole-on) so the
+        // concentric depth shells separate visually — used by preview tests and
+        // handy for a demo "look at the water column" angle.
+        tilt(deg) {
+          spinning = false;
+          const d = camera.position.length();
+          const dir = camera.position.clone().normalize();
+          const axis = new THREE.Vector3().crossVectors(dir, camera.up).normalize();
+          dir.applyAxisAngle(axis, THREE.MathUtils.degToRad(deg));
+          camera.position.copy(dir.multiplyScalar(d));
+          controls.update();
         },
       };
 
@@ -1012,10 +1264,25 @@
       }
 
       // Opacity slider: dissolve the glowing field toward the bare dark globe.
+      // applyShellStyles owns both the surface-cap and per-shell opacity (they
+      // trade off with the depth focus), so route the slider through it. When no
+      // volume is loaded yet, fall back to setting the surface directly.
       opacityEl.addEventListener('input', () => {
         layerOpacity = Number(opacityEl.value) / 100;
         opacityValEl.textContent = `${opacityEl.value}%`;
-        applyOpacity();
+        if (shellMeshes.length) applyShellStyles();
+        else applyOpacity();
+      });
+
+      // Vertical-exaggeration slider: spread the depth shells radially so the
+      // (very shallow, very wide) ocean reads as a real 3D column. No refetch —
+      // just re-scales each shell.
+      const exagEl    = document.getElementById('exag');
+      const exagValEl = document.getElementById('exag-val');
+      exagEl.addEventListener('input', () => {
+        exaggeration = Number(exagEl.value);
+        exagValEl.textContent = `${exaggeration.toFixed(1)}×`;
+        applyShellStyles();
       });
 
       // Palette selector: swap the active colormap; globe + legend both follow.
@@ -1096,6 +1363,10 @@
       // absolute domain, else a safe unit interval.
       function effRange() {
         if (rangeOverride) return [rangeOverride.min, rangeOverride.max];
+        // A focused deep shell drives the legend to that layer's own range so the
+        // colours on the globe match the ticks; null falls back to the surface.
+        if (focusRange && focusRange.min != null && focusRange.max != null)
+          return [focusRange.min, focusRange.max];
         if (displayRange && displayRange.min != null && displayRange.max != null)
           return [displayRange.min, displayRange.max];
         const v = variables[current];
@@ -1120,6 +1391,7 @@
       // fast path for palette / scale / range edits (data is already in hand).
       function repaint() {
         if (lastField) applyColors(lastField);
+        repaintVolume();
         paintLegend();
       }
 
@@ -1129,15 +1401,17 @@
       function refreshColorbar() {
         rangeOverride = null;
         displayRange = null;
+        focusRange = null;
         rangeMinEl.value = ''; rangeMaxEl.value = '';
         paintLegend();
       }
 
       async function loadSlice() {
-        const depth = depths[Number(depthEl.value)];
+        // The surface mesh is always the shallowest level; the depth slider now
+        // focuses a shell in the volume rather than swapping this slice.
+        const depth = depths[0];
         const time  = times[Number(timeEl.value)];
         const seq = ++reqSeq;
-        depthValEl.textContent = `${depth} m`;
         timeValEl.textContent = fmtTime(time);
         statusEl.textContent = 'loading slice…';
         try {
@@ -1153,11 +1427,13 @@
           applyColors(f);
           paintLegend();
           statusEl.textContent =
-            `Slice range ${f.value_min}–${f.value_max} ${f.units}`;
+            `Surface ${f.value_min}–${f.value_max} ${f.units} · focus ${focusDepth} m`;
         } catch (e) {
           if (seq !== reqSeq) return;
           statusEl.innerHTML = `<span class="err">slice failed: ${e.message}</span>`;
         }
+        // Fetch the deeper water column alongside the surface (shares reqSeq).
+        loadVolume();
       }
 
       function selectVariable(name) {
@@ -1294,9 +1570,15 @@
           }
           if (!variables[current]) current = Object.keys(variables)[0];
 
-          // Depth + time sliders.
+          // Depth slider now FOCUSES a shell in the water column (no refetch):
+          // it emphasises the shell nearest that depth and fades the rest.
           depthEl.max = String(depths.length - 1);
-          depthEl.addEventListener('input', loadSlice);
+          depthValEl.textContent = `${depths[0]} m`;
+          depthEl.addEventListener('input', () => {
+            focusDepth = depths[Number(depthEl.value)];
+            depthValEl.textContent = `${focusDepth} m`;
+            applyShellStyles();
+          });
           timeEl.max = String(Math.max(0, times.length - 1));
           timeEl.addEventListener('input', loadSlice);
           timeValEl.textContent = fmtTime(times[0]);
