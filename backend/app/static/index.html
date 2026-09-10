@@ -180,6 +180,15 @@
       #profile .p-vars button:hover:not(.active) { color: var(--ink); }
       #profile .p-vars button.active { color: var(--space); background: var(--cyan-2); border-color: var(--cyan-2); font-weight: 600; }
       #profile canvas { width: 100% !important; height: 200px !important; }
+      #profile .p-diff {
+        margin: -2px 0 10px; font-family: var(--mono); font-size: 10.5px;
+        color: var(--ink-2); display: flex; flex-direction: column; gap: 2px;
+        padding: 6px 10px; border-radius: 6px; background: rgba(7, 19, 31, 0.6);
+        border: 1px solid var(--edge-2);
+      }
+      #profile .p-diff.empty { color: var(--ink-3); }
+      #profile .p-diff .pd-src { color: var(--cyan-2); font-weight: 500; }
+      #profile .p-diff .pd-stats { color: var(--ink-2); }
 
       /* ---- quality floor: keyboard focus, reduced motion, small screens ----*/
       :focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; border-radius: 3px; }
@@ -239,6 +248,12 @@
           </span>
         </div>
         <input type="range" id="time" min="0" max="0" step="1" value="0" aria-label="Time" />
+      </div>
+
+      <div class="switch">
+        <span class="name">Auto-rotate</span>
+        <input type="checkbox" id="auto-rotate" checked />
+        <label class="track" for="auto-rotate" aria-label="Toggle globe auto-rotation"></label>
       </div>
 
       <div class="switch">
@@ -312,6 +327,7 @@
       </div>
       <div class="p-meta" id="p-meta"></div>
       <div class="p-vars" id="p-vars"></div>
+      <div class="p-diff" id="p-diff"></div>
       <canvas id="p-chart"></canvas>
     </div>
 
@@ -942,11 +958,9 @@
           m.material.uniforms.uOpacity.value = Math.min(1, base * layerOpacity);
           m.renderOrder = (m === nearest) ? 2 : 1;
         }
-        // Surface cap: bright when it's the focused layer, else a faint context
-        // shell so a lit deeper layer shows through instead of being occluded.
+        // Surface cap: keep fully visible at active layerOpacity
         if (dataMesh) {
-          const surf = surfaceFocused ? 1 : 0.16;
-          dataMesh.material.uniforms.uOpacity.value = surf * layerOpacity;
+          dataMesh.material.uniforms.uOpacity.value = layerOpacity;
         }
         // Each layer is coloured on its own range, so the legend follows the lit
         // layer. Surface uses the on-screen slice range (displayRange); a deeper
@@ -1188,9 +1202,19 @@
       // Auto-spin is the one ambient motion; honour prefers-reduced-motion by
       // starting still (and staying on the Indian Ocean data we opened facing).
       const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
-      let spinning = !reduceMotion;
+      let autoRotate = !reduceMotion;   // persistent user intent (Auto-rotate switch)
+      let spinning = autoRotate;        // effective spin (also paused mid-drag)
       controls.addEventListener('start', () => { spinning = false; });
-      controls.addEventListener('end',   () => { spinning = !reduceMotion; });
+      controls.addEventListener('end',   () => { spinning = autoRotate; });
+      // Auto-rotate switch: a persistent pause/resume for the ambient spin.
+      const autoRotateEl = document.getElementById('auto-rotate');
+      if (autoRotateEl) {
+        autoRotateEl.checked = autoRotate;
+        autoRotateEl.addEventListener('change', () => {
+          autoRotate = autoRotateEl.checked;
+          spinning = autoRotate;
+        });
+      }
       addEventListener('resize', () => {
         camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
         renderer.setSize(innerWidth, innerHeight);
@@ -1407,9 +1431,9 @@
       }
 
       async function loadSlice() {
-        // The surface mesh is always the shallowest level; the depth slider now
-        // focuses a shell in the volume rather than swapping this slice.
-        const depth = depths[0];
+        const depthIdx = Number(depthEl.value) || 0;
+        const depth = (depths && depths[depthIdx] != null) ? depths[depthIdx] : 0;
+        focusDepth = depth;
         const time  = times[Number(timeEl.value)];
         const seq = ++reqSeq;
         timeValEl.textContent = fmtTime(time);
@@ -1420,14 +1444,13 @@
           // A slower earlier request must not overwrite a newer slice.
           if (seq !== reqSeq) return;
           // Colour to the data actually on screen so the whole ramp is used and
-          // this slice's spatial structure is legible (a warm surface layer
-          // spans only a sliver of the fixed column domain otherwise).
+          // this slice's spatial structure is legible.
           displayRange = { min: f.value_min, max: f.value_max };
           ensureGlobe(f);
           applyColors(f);
           paintLegend();
           statusEl.textContent =
-            `Surface ${f.value_min}–${f.value_max} ${f.units} · focus ${focusDepth} m`;
+            `Depth ${f.depth}m · ${f.value_min}–${f.value_max} ${f.units}`;
         } catch (e) {
           if (seq !== reqSeq) return;
           statusEl.innerHTML = `<span class="err">slice failed: ${e.message}</span>`;
@@ -1465,33 +1488,66 @@
       async function drawProfile() {
         if (!activeInst) return;
         const time = times[Number(timeEl.value)];
-        const url = `/instruments/${activeInst.id}/profile?variable=${profVar}&time=${encodeURIComponent(time)}`;
-        let p;
-        try { p = await (await fetch(url)).json(); }
+        const obsUrl = `/instruments/${activeInst.id}/profile?variable=${profVar}&time=${encodeURIComponent(time)}`;
+        const cmpUrl = `/api/comparison/argo/${encodeURIComponent(activeInst.id)}?variable=${profVar}`;
+        let p, cmp = null;
+        try { p = await (await fetch(obsUrl)).json(); }
         catch (e) { return; }
+        if (activeInst.kind === 'argo') {
+          try { const r = await fetch(cmpUrl); cmp = r.ok ? await r.json() : null; }
+          catch (e) { cmp = null; }
+        }
         const latTxt = `${Math.abs(p.lat).toFixed(1)}°${p.lat >= 0 ? 'N' : 'S'}`;
         const lonTxt = `${Math.abs(p.lon).toFixed(1)}°${p.lon >= 0 ? 'E' : 'W'}`;
         document.getElementById('p-meta').innerHTML =
           `<span class="p-coord">${latTxt}, ${lonTxt}</span><span class="p-date">${fmtTime(p.time)}</span>`;
+
         // Depth increases downward: plot value on X, depth on Y (inverted).
-        const points = p.depths.map((d, i) => ({ x: p.values[i], y: d }));
-        // Neon palette, matching the globe colormap: warm magenta end for
-        // temperature, cool cyan for salinity (no off-theme orange/red).
+        const obsPoints = p.depths.map((d, i) => ({ x: p.values[i], y: d }));
         const accent = profVar === 'salinity' ? '#4fc9ec' : '#f65fb8';
+        const datasets = [{
+          label: 'Observed', data: obsPoints,
+          borderColor: accent, backgroundColor: accent,
+          pointRadius: 2.5, borderWidth: 2, tension: 0.3,
+        }];
+
+        const diffEl = document.getElementById('p-diff');
+        const match = cmp && cmp.comparisons && cmp.comparisons[0];
+        if (activeInst.kind !== 'argo' || !diffEl) {
+          if (diffEl) { diffEl.style.display = 'none'; diffEl.innerHTML = ''; }
+        } else if (match) {
+          datasets.push({
+            label: 'Model',
+            data: match.levels.map(l => ({ x: l.model, y: l.model_depth })),
+            borderColor: '#e8f4fa', backgroundColor: '#e8f4fa',
+            borderDash: [5, 4], pointRadius: 0, borderWidth: 1.5, tension: 0.3,
+          });
+          const s = match.summary;
+          const meanFixed = s.mean_difference.toFixed(2);
+          const mean = parseFloat(meanFixed) === 0 ? '0.00'
+            : (s.mean_difference > 0 ? '+' + meanFixed : meanFixed);
+          const srcShort = (cmp.model.source || 'model').split('·')[0].trim();
+          diffEl.style.display = ''; diffEl.className = 'p-diff';
+          diffEl.innerHTML =
+            `<span class="pd-src">vs ${srcShort} · ${fmtTime(match.model_time)}</span>` +
+            `<span class="pd-stats">Δ mean ${mean} · rms ${s.rms_difference.toFixed(2)} · max |Δ| ${s.max_abs_difference.toFixed(2)} ${cmp.units}</span>`;
+        } else {
+          const reason = cmp && cmp.unmatched && cmp.unmatched[0] ? cmp.unmatched[0].reason : 'no model overlap here';
+          diffEl.style.display = ''; diffEl.className = 'p-diff empty';
+          diffEl.innerHTML =
+            `<span class="pd-src">Model − observed</span><span class="pd-stats">${reason}</span>`;
+        }
+
         if (profChart) profChart.destroy();
         profChart = new Chart(document.getElementById('p-chart'), {
           type: 'line',
-          data: { datasets: [{
-            label: `${VAR_LABELS[profVar] || profVar} (${p.units})`,
-            data: points, borderColor: accent, backgroundColor: accent,
-            pointRadius: 2.5, tension: 0.3,
-          }]},
+          data: { datasets },
           options: {
             responsive: true, maintainAspectRatio: false,
             plugins: { legend: { labels: { color: '#b7c6d4', boxWidth: 12, font: { size: 11 } } } },
             scales: {
               x: { type: 'linear', position: 'top', bounds: 'data',
-                   title: { display: true, text: p.units, color: '#8aa0b2' },
+                   title: { display: true, text: `${VAR_LABELS[profVar] || profVar} (${p.units})`, color: '#8aa0b2' },
                    ticks: { color: '#8aa0b2' }, grid: { color: 'rgba(120,150,180,0.12)' } },
               y: { type: 'linear', reverse: true, min: 0,
                    title: { display: true, text: 'Depth (m)', color: '#8aa0b2' },
@@ -1577,7 +1633,7 @@
           depthEl.addEventListener('input', () => {
             focusDepth = depths[Number(depthEl.value)];
             depthValEl.textContent = `${focusDepth} m`;
-            applyShellStyles();
+            loadSlice();
           });
           timeEl.max = String(Math.max(0, times.length - 1));
           timeEl.addEventListener('input', loadSlice);

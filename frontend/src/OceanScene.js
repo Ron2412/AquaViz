@@ -71,7 +71,10 @@ export class OceanScene {
     const scale = 100 / Math.max(spanLon, spanLat)
     const midLon = lon[0] + spanLon / 2
     const midLat = lat[0] + spanLat / 2
-    const range = value_max - value_min || 1
+    const vMin = value_min ?? 0
+    const range = (value_max != null && value_min != null && value_max > value_min)
+      ? (value_max - value_min)
+      : 1
 
     const positions = new Float32Array(nlat * nlon * 3)
     const colors = new Float32Array(nlat * nlon * 3)
@@ -79,7 +82,7 @@ export class OceanScene {
     for (let j = 0; j < nlat; j++) {
       for (let i = 0; i < nlon; i++) {
         const v = values[j][i]
-        const tn = v == null ? 0 : (v - value_min) / range
+        const tn = v == null ? 0 : (v - vMin) / range
         positions[p] = (lon[i] - midLon) * scale
         positions[p + 1] = v == null ? 0 : tn * this.exaggeration
         positions[p + 2] = -(lat[j] - midLat) * scale

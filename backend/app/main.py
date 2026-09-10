@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from app.config import settings
-from app.routers import fields, instruments
+from app.routers import comparison, fields, instruments
 
 _STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -39,6 +39,7 @@ app.add_middleware(
 
 app.include_router(fields.router)
 app.include_router(instruments.router)
+app.include_router(comparison.router)
 
 
 @app.get("/health", tags=["meta"])
@@ -72,5 +73,7 @@ def api_info() -> dict:
             "/temperature",
             "/instruments",
             "/instruments/{id}/profile",
+            "/api/comparison/argo",
+            "/api/comparison/argo/{float_id}",
         ],
     }
